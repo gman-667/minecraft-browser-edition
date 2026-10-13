@@ -1,1 +1,92 @@
-
+name: Migrate Desktop and Lite to Pages
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release containing minecraft-console-pages.zip
+        required: true
+        type: string
+      archive_sha256:
+        description: SHA-256 of the prepared migration archive
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download reviewed release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]] || exit 1
+          [[ "$ARCHIVE_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || exit 1
+          gh release download --repo "$GH_REPO" --pattern minecraft-console-pages.zip --dir "$RUNNER_TEMP" -- "$RELEASE_TAG"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$RUNNER_TEMP/minecraft-console-pages.zip" | sha256sum --check --status
+      - name: Validate and extract browser files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, stat, zipfile
+          site = pathlib.Path(os.environ['RUNNER_TEMP']) / 'site'
+          with zipfile.ZipFile(pathlib.Path(os.environ['RUNNER_TEMP']) / 'minecraft-console-pages.zip') as bundle:
+              if sum(item.file_size for item in bundle.infolist()) >= 1_000_000_000:
+                  raise SystemExit('Site exceeds GitHub Pages size limit')
+              for item in bundle.infolist():
+                  name = pathlib.PurePosixPath(item.filename)
+                  if name.is_absolute() or '..' in name.parts or '\\' in item.filename or ':' in item.filename:
+                      raise SystemExit('Unsafe archive path')
+                  if stat.S_ISLNK(item.external_attr >> 16):
+                      raise SystemExit('Archive contains a symlink')
+              bundle.extractall(site)
+          manifest = json.loads((site / 'pages-manifest.json').read_text())
+          if manifest.get('backend') != 'xbox360' or manifest.get('schemaVersion') != 2 or manifest.get('artifactMigrationChecked') is not True:
+              raise SystemExit('Expected a checked Desktop and Lite artifact migration')
+          for edition, folder in [('desktop', site), ('lite', site / 'lite')]:
+              for name in ['Minecraft.Client.js', 'Minecraft.Client.wasm', 'Minecraft.Client.data']:
+                  path = site / name if name.endswith('.data') else folder / name
+                  with path.open('rb') as stream:
+                      digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                  if digest != manifest['sourceEngineHashes'][edition][name]:
+                      raise SystemExit('Migration changed the original engine: ' + edition + '/' + name)
+          expected = {'pages-manifest.json'}
+          for entry in manifest['files']:
+              name = pathlib.PurePosixPath(entry['path'])
+              if name.is_absolute() or '..' in name.parts or '\\' in entry['path'] or ':' in entry['path']:
+                  raise SystemExit('Unsafe manifest path')
+              path = site / entry['path']
+              if path.stat().st_size != entry['bytes']:
+                  raise SystemExit('Release file size differs: ' + entry['path'])
+              digest = hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+              if digest != entry['sha256']:
+                  raise SystemExit('Release file hash differs: ' + entry['path'])
+              expected.add(entry['path'])
+          actual = {path.relative_to(site).as_posix() for path in site.rglob('*') if path.is_file()}
+          if actual != expected:
+              raise SystemExit('Archive includes unexpected files')
+          PY
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+  deploy:
+    needs: stage
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy static site
+        id: deployment
+        uses: actions/deploy-pages@v4
